@@ -56,6 +56,6 @@ jobs:
           LATEST_VER=$(git tag -l "v*.*.*" | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" | sort -V | tail -n 1)
           echo "🔍 Latest upstream version: $LATEST_VER"
 
-          # Directly trigger release workflow to build + push images
-          gh workflow run release.yml --ref main
+          # Dispatch release workflow on THIS fork (not upstream)
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref main
           echo "🚀 Build triggered. Check Actions tab for progress."
