@@ -24,17 +24,21 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # Merge code if there are new commits
           BEFORE=$(git rev-parse HEAD)
           if git merge upstream/main --no-edit; then
             AFTER=$(git rev-parse HEAD)
             if [ "$BEFORE" != "$AFTER" ]; then
               git push origin main
-              git push origin --tags
-              echo "✅ Synced and tags pushed — release.yml will auto-build if new version tags exist."
+              echo "✅ Code synced from upstream."
             else
-              echo "Already up to date, nothing to sync."
+              echo "Code already up to date."
             fi
           else
             echo "⚠️ Merge conflict! Please resolve manually."
             exit 1
           fi
+
+          # Always push upstream tags — new version tags will trigger release.yml
+          git push origin --tags
+          echo "✅ Tags pushed — release.yml will auto-build if new version tags exist."
