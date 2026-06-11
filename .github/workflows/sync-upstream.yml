@@ -1,0 +1,40 @@
+name: sync-upstream
+
+# 每天 UTC 02:00（北京时间 10:00）自动同步上游代码，也可手动触发
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync from upstream
+        run: |
+          git remote add upstream https://github.com/Gloridust/WechatOnCloud.git
+          git fetch upstream --tags
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BEFORE=$(git rev-parse HEAD)
+          if git merge upstream/main --no-edit; then
+            AFTER=$(git rev-parse HEAD)
+            if [ "$BEFORE" != "$AFTER" ]; then
+              git push origin main
+              git push origin --tags
+              echo "✅ Synced and tags pushed — release.yml will auto-build if new version tags exist."
+            else
+              echo "Already up to date, nothing to sync."
+            fi
+          else
+            echo "⚠️ Merge conflict! Please resolve manually."
+            exit 1
+          fi
