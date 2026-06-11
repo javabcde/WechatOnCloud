@@ -59,7 +59,6 @@ jobs:
         with:
           images: |
             ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
-            ${{ vars.DOCKERHUB_USERNAME != '' && format('docker.io/{0}/{1}', vars.DOCKERHUB_USERNAME, matrix.image) || '' }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -78,6 +77,20 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      - name: Debug list packages
+        continue-on-error: true
+        run: |
+          echo "=== All container packages ==="
+          curl -s -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+            "https://api.github.com/user/packages?package_type=container" | \
+            python3 -c "import sys,json; [print(p['name'], p.get('visibility','?')) for p in json.load(sys.stdin)]" 2>/dev/null || echo "(listing failed)"
+          echo "=== Get ${{ matrix.image }} ==="
+          curl -s -w "\nHTTP %{http_code}\n" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+            "https://api.github.com/user/packages/container/${{ matrix.image }}"
 
       - name: Make package public
         continue-on-error: true
