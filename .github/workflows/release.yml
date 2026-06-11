@@ -2,6 +2,7 @@ name: release
 
 # 推送 vX.Y.Z 标签或在 GitHub 上发布 Release 时，构建并推送多架构镜像到 GHCR。
 # 也可手动触发（workflow_dispatch）只打 latest，便于验证流水线。
+# 需要的 Secrets：GH_PAT（含 packages:write 权限的 PAT，用于自动设镜像为公开）
 on:
   push:
     tags:
@@ -90,3 +91,10 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      - name: Make package public
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh api --method PATCH "/user/packages/container/${{ matrix.image }}/visibility" \
+            -f visibility=public
