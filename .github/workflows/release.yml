@@ -1,8 +1,5 @@
 name: release
 
-# 推送 vX.Y.Z 标签或在 GitHub 上发布 Release 时，构建并推送多架构镜像到 GHCR。
-# 也可手动触发（workflow_dispatch）只打 latest，便于验证流水线。
-# 需要的 Secrets：GH_PAT（含 packages:write 权限的 PAT，用于自动设镜像为公开）
 on:
   push:
     tags:
@@ -13,8 +10,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  WECHAT_IMAGE: ${{ github.repository_owner }}/wechat-on-cloud
-  PANEL_IMAGE: ${{ github.repository_owner }}/woc-panel
 
 jobs:
   build:
@@ -86,16 +81,20 @@ jobs:
 
       - name: Make package public
         continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           for i in 1 2 3 4 5; do
-            if gh api --method PATCH "/user/packages/container/${{ matrix.image }}/visibility" \
-              -f visibility=public 2>/dev/null; then
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X PATCH \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+              "https://api.github.com/user/packages/container/${{ matrix.image }}/visibility" \
+              -d '{"visibility":"public"}')
+            if [ "$STATUS" = "204" ]; then
               echo "✅ ${{ matrix.image }} is now public."
               exit 0
             fi
-            echo "⏳ API not ready yet, retry $i/5..."
+            echo "⏳ API returned $STATUS, retry $i/5..."
             sleep 10
           done
-          echo "⚠️ Could not set ${{ matrix.image }} to public. Do it manually: https://github.com/javabcde/WechatOnCloud/pkgs/container/${{ matrix.image }}/settings"
+          echo "⚠️ Could not make public. Do it manually:"
+          echo "   https://github.com/javabcde/WechatOnCloud/pkgs/container/${{ matrix.image }}/settings"
