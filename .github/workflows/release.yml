@@ -46,13 +46,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
-        if: vars.DOCKERHUB_USERNAME != ''
-        uses: docker/login-action@v3
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Docker metadata (tags + labels)
         id: meta
         uses: docker/metadata-action@v5
@@ -78,36 +71,27 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
-      - name: Debug list packages
-        continue-on-error: true
-        run: |
-          echo "=== All container packages ==="
-          curl -s -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
-            "https://api.github.com/user/packages?package_type=container" | \
-            python3 -c "import sys,json; [print(p['name'], p.get('visibility','?')) for p in json.load(sys.stdin)]" 2>/dev/null || echo "(listing failed)"
-          echo "=== Get ${{ matrix.image }} ==="
-          curl -s -w "\nHTTP %{http_code}\n" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
-            "https://api.github.com/user/packages/container/${{ matrix.image }}"
-
       - name: Make package public
         continue-on-error: true
         run: |
-          for i in 1 2 3 4 5; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              -X PATCH \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
-              "https://api.github.com/user/packages/container/${{ matrix.image }}/visibility" \
-              -d '{"visibility":"public"}')
-            if [ "$STATUS" = "204" ]; then
-              echo "✅ ${{ matrix.image }} is now public."
-              exit 0
-            fi
-            echo "⏳ API returned $STATUS, retry $i/5..."
-            sleep 10
-          done
-          echo "⚠️ Could not make public. Do it manually:"
-          echo "   https://github.com/javabcde/WechatOnCloud/pkgs/container/${{ matrix.image }}/settings"
+          VIS=$(curl -s -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+            "https://api.github.com/user/packages/container/${{ matrix.image }}" | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('visibility',''))" 2>/dev/null)
+
+          if [ "$VIS" = "public" ]; then
+            echo "✅ ${{ matrix.image }} already public."
+            exit 0
+          fi
+
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+            "https://api.github.com/user/packages/container/${{ matrix.image }}/visibility" \
+            -d '{"visibility":"public"}')
+          if [ "$STATUS" = "204" ]; then
+            echo "✅ ${{ matrix.image }} is now public."
+          else
+            echo "⚠️ HTTP $STATUS — set manually: https://github.com/javabcde/WechatOnCloud/pkgs/container/${{ matrix.image }}/settings"
+          fi
