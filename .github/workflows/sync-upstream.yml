@@ -35,6 +35,7 @@ jobs:
           if git merge --allow-unrelated-histories -X theirs upstream/main --no-commit --no-ff; then
             if [ -d ".github/workflows" ]; then
               git checkout HEAD -- .github/workflows/
+              git clean -fd .github/workflows/
             fi
             if git commit -m "Auto sync from upstream"; then
               git push origin temp-sync:main
