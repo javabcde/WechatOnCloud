@@ -36,6 +36,7 @@ jobs:
             if [ -d ".github/workflows" ]; then
               git checkout HEAD -- .github/workflows/
               git clean -fd .github/workflows/
+              git diff --cached --name-only .github/workflows/ | xargs -r git rm --cached --
             fi
             if git commit -m "Auto sync from upstream"; then
               git push origin temp-sync:main
