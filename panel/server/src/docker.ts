@@ -6,7 +6,50 @@ import zlib from 'node:zlib';
 import Docker from 'dockerode';
 import { instanceAppType, getDesktopDark, type Instance } from './store.js';
 
-const WECHAT_IMAGE = process.env.WOC_WECHAT_IMAGE || 'ghcr.io/gloridust/wechat-on-cloud:latest';
+// 实例镜像引用。版本耦合（架构守则 R1）：面板与实例镜像同一 release 同步出包、按同版本号
+// 互相验证——正式版面板把 :latest 改写为与自身相同的版本 tag（如 1.4.1），保证
+// 「面板 vX 管的实例镜像也是 vX」，杜绝旧面板拉到新实例镜像（或反之）产生未验证组合。
+// 用户在 env 显式指定了非 latest tag（自行锁版）则完全尊重；开发版面板（dev-*）保持 latest。
+function resolveWechatImage(): string {
+  const raw = process.env.WOC_WECHAT_IMAGE || 'ghcr.io/gloridust/wechat-on-cloud:latest';
+  const ver = (process.env.WOC_VERSION || '').trim().replace(/^v/, '');
+  if (!/^\d+\.\d+\.\d+$/.test(ver)) return raw; // 开发版/未知版本 → 保持原样
+  const noDigest = raw.split('@')[0];
+  const m = noDigest.match(/^(.*):([^/:]+)$/);
+  if (m && m[2] !== 'latest') return raw; // 用户显式锁了别的 tag → 尊重
+  const repo = m ? m[1] : noDigest;
+  return `${repo}:${ver}`;
+}
+// 注意：可被 resolveInstanceImage() 在启动时改写为 :latest 兜底（见下），故用 let。
+let WECHAT_IMAGE = resolveWechatImage();
+
+// 版本耦合的安全兜底（P0：issue #112 后续）。版本耦合让面板偏好「与自身同版本」的实例镜像 tag，
+// 但若该 tag 在本地和 registry 都不存在——典型如某次 CI 只发布了面板、实例镜像构建失败——
+// 面板就会指向一个不存在的 tag，导致：可升级检测恒空（指示器消失）、创建/升级实例拉取失败。
+// 故启动时校验一次：偏好的具体版本 tag 不可达 → 回退 :latest，保证功能永不因版本错配而瘫痪。
+let imageResolved = false;
+export async function resolveInstanceImage(): Promise<void> {
+  if (imageResolved) return;
+  imageResolved = true;
+  const preferred = WECHAT_IMAGE;
+  const tagM = preferred.split('@')[0].match(/:([^/:]+)$/);
+  if (!tagM || tagM[1] === 'latest') return; // 已是 latest 或无 tag → 无需兜底
+  try {
+    await docker.getImage(preferred).inspect();
+    return; // 本地已有该版本镜像 → 用它
+  } catch {
+    /* 本地没有，继续查 registry */
+  }
+  const ref = parseImageRef(preferred);
+  const remote = ref ? await fetchManifestDigest(ref) : null;
+  if (remote) return; // registry 上存在该版本 → 用它（ensureImage 会拉）
+  const fallback = preferred.replace(/:[^/:]+$/, ':latest');
+  appendPanelLog(
+    'WARN',
+    `实例镜像 ${preferred} 在本地与镜像仓库均不存在，回退使用 ${fallback}（很可能该版本的实例镜像未成功发布；升级/检测将基于 :latest）`,
+  );
+  WECHAT_IMAGE = fallback;
+}
 const PUID = process.env.PUID || '1000';
 const PGID = process.env.PGID || '1000';
 const TZ = process.env.TZ || 'Asia/Shanghai';
@@ -182,6 +225,7 @@ function envList(inst: Instance): string[] {
 
 // 确保微信镜像在本地存在；缺失则从 GHCR 拉取（首次新建实例时镜像通常还没拉过）。
 async function ensureImage(): Promise<void> {
+  await resolveInstanceImage(); // 版本兜底：若耦合的版本 tag 不可达则先回退 :latest
   try {
     await docker.getImage(WECHAT_IMAGE).inspect();
     return;
@@ -202,18 +246,26 @@ async function ensureImage(): Promise<void> {
 }
 
 // 创建并启动一个微信实例容器。若同名容器已存在则先移除（仅容器，不动卷）。
-export async function runInstance(inst: Instance): Promise<void> {
+// keepImage（稳定性关键）：重启/自愈必须幂等——沿用该实例当前正在跑的镜像重建，
+// 绝不因"本地 :latest 恰好被某次拉取更新过"就悄悄换镜像（那等于一次没人要求的隐式升级；
+// 若本地新镜像恰好是坏的，一次看门狗自愈就能弄坏一个用户从没升级过的实例）。
+// 换镜像只允许发生在显式「升级实例」（不带 keepImage）。
+export async function runInstance(inst: Instance, opts?: { keepImage?: boolean }): Promise<void> {
   const net = await ensureNetwork();
-  await ensureImage();
+  let imageOverride: string | undefined;
   try {
     const existing = docker.getContainer(inst.containerName);
-    await existing.inspect();
+    const info = await existing.inspect();
+    if (opts?.keepImage && info.Image) imageOverride = String(info.Image);
     // 删除前先把旧容器最后日志快照进持久日志，否则随容器删除就看不到"上次为何停/崩"。
     await snapshotContainerLog(inst, '容器重建（重启/升级/自愈），保留上一容器最后日志');
     await existing.remove({ force: true });
   } catch {
     /* 不存在，正常 */
   }
+  // 沿用旧镜像重建时无需 ensureImage（镜像 id 一定在本地——容器刚在用它）；
+  // 也避免"离线 + 本地无 :latest"时连重启都失败。
+  if (!imageOverride) await ensureImage();
   // 摄像头设备（探测不到则为空数组 → 仅摄像头不可用，音频/麦克风照常）
   const vids = videoDevices();
   const dris = ENABLE_GPU ? driDevices() : [];
@@ -223,6 +275,9 @@ export async function runInstance(inst: Instance): Promise<void> {
     SecurityOpt: ['seccomp=unconfined'],
     ShmSize: SHM_SIZE,
     RestartPolicy: { Name: 'unless-stopped' },
+    // 日志硬上限：docker 默认 json-file 无大小限制，应用崩溃循环（每 2s 刷错误）会把宿主磁盘
+    // 无限吃掉（群晖用户反馈"一下子 1TB 没了"的元凶之一）。每实例封顶 20MB×2。
+    LogConfig: { Type: 'json-file', Config: { 'max-size': '20m', 'max-file': '2' } },
   };
   if (INSTANCE_MEM > 0) {
     hostConfig.Memory = INSTANCE_MEM;
@@ -248,7 +303,7 @@ export async function runInstance(inst: Instance): Promise<void> {
   const mac = realisticMac(inst.id);
   const createOpts: Docker.ContainerCreateOptions = {
     name: inst.containerName,
-    Image: WECHAT_IMAGE,
+    Image: imageOverride || WECHAT_IMAGE,
     // 内部 hostname 伪装成"个人电脑"名（不再用 woc-wx-<hex>，那是容器/服务器特征）。
     // 反代靠容器名 name 寻址，与此 hostname 无关。
     Hostname: realisticHostname(inst.id),
@@ -293,13 +348,71 @@ export async function ensureRunning(inst: Instance): Promise<void> {
 
 // 升级实例：拉取最新微信镜像后重建容器（保留数据卷 → 登录态不丢）。
 // 拉取失败（本地自构建 / 离线 / 仓库不可达）则用本地现有镜像重建，不阻断。
-export async function upgradeInstance(inst: Instance): Promise<void> {
-  try {
-    await pullImage();
-  } catch (e: any) {
-    console.warn('[docker] 升级时拉取镜像失败，改用本地镜像重建:', e?.message || e);
+// skipPull：批量升级时由调用方先统一拉取一次，避免 N 个实例拉 N 次（受限网络下每次
+// 都要等到拉取停滞超时，表现为"一键升级卡死"）。
+export async function upgradeInstance(inst: Instance, opts?: { skipPull?: boolean }): Promise<void> {
+  let pullErr: any = null;
+  if (!opts?.skipPull) {
+    try {
+      await pullImage();
+    } catch (e: any) {
+      pullErr = e;
+      console.warn('[docker] 升级时拉取镜像失败，改用本地镜像重建:', e?.message || e);
+    }
   }
+  // 记录升级前镜像，用于事后判断"升级是否真的换了镜像"（issue #112：拉取失败静默回退旧镜像，
+  // 用户被告知"完成"、实际什么都没变，且无从自查）。
+  const before = await (async () => {
+    try {
+      const info: any = await docker.getContainer(inst.containerName).inspect();
+      return String(info.Image || '');
+    } catch {
+      return '';
+    }
+  })();
+  // 升级不改变用户的运行状态：原本停止的实例，升级（重建）后停回去，而不是悄悄拉起。
+  const wasStopped = (await instanceRuntime(inst)) === 'stopped';
   await runInstance(inst);
+  if (wasStopped) {
+    try {
+      await stopInstance(inst);
+      appendInstanceLog(inst.id, '升级完成，恢复原有的停止状态');
+    } catch {
+      /* 停不回去也不算失败 */
+    }
+  }
+  const after = await (async () => {
+    try {
+      const info: any = await docker.getContainer(inst.containerName).inspect();
+      return String(info.Image || '');
+    } catch {
+      return '';
+    }
+  })();
+  if (pullErr && before && after === before) {
+    // 诚实汇报：拉取失败且镜像未变 = 这次"升级"没有升级任何东西。抛错让调用方按失败处理，
+    // 用户才知道要去解决网络/镜像源问题，而不是误以为已修复。
+    throw new Error(
+      `拉取新镜像失败（${pullErr?.message || pullErr}），实例仍在原镜像上重建（未升级）。请检查网络/镜像源后重试`,
+    );
+  }
+  if (before && after !== before) {
+    appendInstanceLog(inst.id, `镜像已更换：${before.slice(7, 19)} → ${after.slice(7, 19)}`);
+  } else if (!pullErr) {
+    appendInstanceLog(inst.id, '镜像已是最新，无需更换');
+  }
+}
+
+// 清理悬空（dangling）镜像：升级后旧实例镜像失去 tag 变成 <none>，长期堆积吃磁盘
+// （每层 1-2GB，多次升级后可观）。只删无 tag 且无容器引用的镜像，安全。best-effort。
+export async function pruneDanglingImages(): Promise<void> {
+  try {
+    const res: any = await docker.pruneImages({ filters: { dangling: ['true'] } as any });
+    const freed = Number(res?.SpaceReclaimed || 0);
+    if (freed > 0) appendPanelLog('INFO', `已清理悬空镜像，释放 ${(freed / 1024 / 1024 / 1024).toFixed(2)} GB`);
+  } catch (e: any) {
+    console.warn('[docker] 清理悬空镜像失败（忽略）:', e?.message || e);
+  }
 }
 
 // 重置实例的设备 machine-id：删掉持久化的 .woc-machine-id 后重启，由 00-woc-identity 钩子重新生成
@@ -319,7 +432,7 @@ export async function regenInstanceMachineId(inst: Instance): Promise<void> {
   // 删除持久化文件；重启时钩子检测到缺失 → 生成新的唯一 machine-id 并写回卷
   await execCapture(inst, ['sh', '-c', 'rm -f /config/.woc-machine-id']);
   await stopInstance(inst);
-  await runInstance(inst);
+  await runInstance(inst, { keepImage: true }); // 重置身份=恢复类操作，幂等：不隐式换镜像（R10）
 }
 
 // 停止实例容器（保留容器与数据卷，可再启动）。
@@ -493,6 +606,140 @@ export async function instanceOutdated(inst: Instance, latestId: string | null):
   }
 }
 
+// 实例容器当前运行镜像的版本号（CI 打的 org.opencontainers.image.version label，如 "1.4.0"）。
+// 本地自构建镜像无该 label → 返回镜像短 id（显示为"自构建 xxxx"级别信息）；容器不存在 → null。
+// 背景（issue #112）：用户无从得知实例到底跑的哪版镜像，"以为升级了其实没有"无法自查。
+export async function instanceImageVersion(inst: Instance): Promise<string | null> {
+  try {
+    const info: any = await docker.getContainer(inst.containerName).inspect();
+    const imgId = String(info.Image || '');
+    if (!imgId) return null;
+    try {
+      const img: any = await docker.getImage(imgId).inspect();
+      const v = img?.Config?.Labels?.['org.opencontainers.image.version'];
+      if (v) return String(v);
+    } catch {
+      /* 镜像记录不可读（containerd 快照残留），退回短 id */
+    }
+    return imgId.replace(/^sha256:/, '').slice(0, 12);
+  } catch {
+    return null;
+  }
+}
+
+// ---------- 远端实例镜像新版检测 ----------
+// 盲区背景：instanceOutdated 只比「容器镜像 vs 本地镜像」。用户更新面板后，本地实例镜像
+// 往往还是旧的（没人主动 pull）→ 检测恒为"无可升级"→ 升级引导永远不出现。这里用 registry
+// manifest digest（HEAD 请求，不下载）对比本地镜像的 RepoDigests，判断远端是否有新版。
+// best-effort：离线/被墙/私有源 → null（未知，不打扰）；本地自构建镜像（无 RepoDigests）→ null。
+let remoteImageCache: { val: boolean | null; at: number } = { val: null, at: 0 };
+let remoteImageInflight: Promise<void> | null = null;
+export function invalidateRemoteImageCache(): void {
+  remoteImageCache = { val: null, at: 0 };
+}
+// 同步返回缓存值（可能 null=未知），过期时后台刷新——upgrade-status 是管理页高频接口，不能被 8s 外呼拖住。
+export function remoteInstanceImageNewer(): boolean | null {
+  const TTL = 30 * 60 * 1000;
+  if (Date.now() - remoteImageCache.at >= TTL && !remoteImageInflight) {
+    remoteImageInflight = checkRemoteImageNewer()
+      .then((v) => {
+        remoteImageCache = { val: v, at: Date.now() };
+      })
+      .catch(() => {
+        remoteImageCache = { val: null, at: Date.now() };
+      })
+      .finally(() => {
+        remoteImageInflight = null;
+      });
+  }
+  return remoteImageCache.at ? remoteImageCache.val : null;
+}
+
+async function checkRemoteImageNewer(): Promise<boolean | null> {
+  const ref = parseImageRef(WECHAT_IMAGE);
+  if (!ref) return null;
+  let local: any;
+  try {
+    local = await docker.getImage(WECHAT_IMAGE).inspect();
+  } catch {
+    // 本地没有该镜像。版本耦合后这是常态：面板刚自更新到 vX，本地还只有旧版镜像、没有 :vX 的 tag。
+    // 只要远端确实存在该镜像（digest 可取）就视为「有新版可拉取」，让升级引导亮起（一键升级会先拉取）。
+    const remote = await fetchManifestDigest(ref);
+    return remote ? true : null;
+  }
+  const repoDigests: string[] = local.RepoDigests || [];
+  if (!repoDigests.length) return null; // 本地自构建（无 registry 来源）→ 无从比较，不打扰
+  const remote = await fetchManifestDigest(ref);
+  if (!remote) return null;
+  return !repoDigests.some((d) => d.endsWith('@' + remote));
+}
+
+// 解析镜像引用 → { registry, repo, tag }。例：docker.io/gloridust/wechat-on-cloud:latest。
+function parseImageRef(image: string): { registry: string; repo: string; tag: string } | null {
+  const noDigest = image.split('@')[0];
+  const segs = noDigest.split('/');
+  let registry = 'docker.io';
+  if (segs.length > 1 && (segs[0].includes('.') || segs[0].includes(':'))) registry = segs.shift() as string;
+  let last = segs[segs.length - 1] || '';
+  let tag = 'latest';
+  const ti = last.lastIndexOf(':');
+  if (ti > 0) {
+    tag = last.slice(ti + 1);
+    segs[segs.length - 1] = last.slice(0, ti);
+  }
+  const repo = segs.join('/');
+  return repo ? { registry, repo, tag } : null;
+}
+
+async function fetchJsonWithTimeout(url: string, headers: Record<string, string>, ms = 8000): Promise<any> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const res = await fetch(url, { headers, signal: ctrl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// 取 registry 上该 tag 的 manifest digest（多架构 index 的 digest，与本地 RepoDigests 同层级）。
+async function fetchManifestDigest(ref: { registry: string; repo: string; tag: string }): Promise<string | null> {
+  const accept =
+    'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json';
+  let host = ref.registry;
+  let token = '';
+  try {
+    if (ref.registry === 'docker.io') {
+      host = 'registry-1.docker.io';
+      const d = await fetchJsonWithTimeout(
+        `https://auth.docker.io/token?service=registry.docker.io&scope=repository:${ref.repo}:pull`,
+        {},
+      );
+      token = d?.token || '';
+    } else if (ref.registry === 'ghcr.io') {
+      const d = await fetchJsonWithTimeout(`https://ghcr.io/token?service=ghcr.io&scope=repository:${ref.repo}:pull`, {});
+      token = d?.token || '';
+    }
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    try {
+      // HEAD 即可拿 Docker-Content-Digest（不下载 manifest 本体）
+      const res = await fetch(`https://${host}/v2/${ref.repo}/manifests/${ref.tag}`, {
+        method: 'HEAD',
+        headers: { accept, ...(token ? { authorization: `Bearer ${token}` } : {}) },
+        signal: ctrl.signal,
+      });
+      if (!res.ok) return null;
+      return res.headers.get('docker-content-digest');
+    } finally {
+      clearTimeout(t);
+    }
+  } catch {
+    return null;
+  }
+}
+
 // 创建 exec 实例。容器 init 未完成时，linuxserver 基镜像的 'abc' 用户可能还没建好，docker 会以
 // 400「unable to find user abc: no matching entries in passwd file」直接拒绝创建 exec（见 issue #74）。
 // 对这种"用户未就绪"错误短暂重试，给容器 init 一点时间；超时则抛清晰的中文错误，而非透传难懂的 docker 400。
@@ -581,8 +828,20 @@ export async function wechatStatus(inst: Instance): Promise<WechatStatus> {
   }
 }
 
-// 拉取微信镜像（首次部署/更新镜像用）。返回拉取日志的最后状态。
-export async function pullImage(onProgress?: (line: any) => void): Promise<void> {
+// 拉取微信镜像（首次部署/更新镜像用）。
+// 并发合并：创建实例/单实例升级/一键升级可能同时触发拉取，同一时刻只跑一个（后来者共享结果；
+// 其 onProgress 不再接收进度，可接受——进度只影响创建向导的百分比显示）。
+let pullInFlight: Promise<void> | null = null;
+export function pullImage(onProgress?: (line: any) => void): Promise<void> {
+  if (pullInFlight) return pullInFlight;
+  pullInFlight = doPullImage(onProgress).finally(() => {
+    pullInFlight = null;
+    invalidateRemoteImageCache(); // 本地镜像可能已更新 → 远端新版检测缓存作废
+  });
+  return pullInFlight;
+}
+
+async function doPullImage(onProgress?: (line: any) => void): Promise<void> {
   // 无进度超时：NAS 直连 docker.io 常卡死（拉取流僵住、永不结束），旧版会让"创建实例"请求无限 hang，
   // 前端一直转圈、还删不掉（issue #99）。这里只要 N 分钟内没有任何进度就中止拉取，让创建带清晰错误快速失败、
   // 用户可重试/删除。默认 5 分钟，WOC_PULL_STALL_MIN 可调。
@@ -1214,12 +1473,15 @@ export async function applyFont(inst: Instance, fontFile: string): Promise<void>
 
 async function applyXsettingsFont(inst: Instance, family: string): Promise<void> {
   const conf = '/config/.xsettingsd';
+  // ⚠️ XSETTINGS 规范里 Xft/DPI 单位是「DPI × 1024」：96 DPI 必须写 98304。误写 96 会让所有
+  // Chromium 内核应用（系统 Chromium / 微信内嵌 CEF）把缩放因子算成≈0 → 变换矩阵不可逆 →
+  // GPU 进程连崩 → 窗口秒关/黑屏（v1.2.9~v1.3.1 的总根因，issue #111）。
   const lines = [
     'Xft/Antialias 1',
     'Xft/Hinting 1',
     'Xft/HintStyle "hintslight"',
     'Xft/RGBA "rgb"',
-    'Xft/DPI 96',
+    'Xft/DPI 98304',
     `Gtk/FontName "${family} 10"`,
   ];
   await execCapture(inst, ['sh', '-c', `printf '%s\\n' ${lines.map(l => `'${l}'`).join(' ')} > ${conf}`]);
