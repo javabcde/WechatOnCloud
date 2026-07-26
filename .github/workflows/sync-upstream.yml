@@ -55,15 +55,21 @@ jobs:
             exit 0
           fi
 
-          # Push latest upstream tag to fork — tag push auto-triggers release.yml
+          # Re-tag fork's main HEAD with upstream's latest version.
+          # We can't push the upstream tag directly because GITHUB_TOKEN
+          # lacks `workflows` permission and the upstream tag's commit
+          # includes .github/workflows changes.
+          # Re-tagging on our HEAD (which has fork's own workflows) avoids
+          # the permission error. Tag push auto-triggers release.yml.
           LATEST_TAG=$(git tag -l "v*.*.*" | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" | sort -V | tail -n 1)
           echo "🔍 Latest upstream tag: $LATEST_TAG"
 
           if [ -n "$LATEST_TAG" ]; then
             REMOTE_TAG=$(git ls-remote --tags origin "refs/tags/$LATEST_TAG" | head -1)
             if [ -z "$REMOTE_TAG" ]; then
+              git tag -f "$LATEST_TAG" main
               git push origin "$LATEST_TAG"
-              echo "🚀 Pushed tag $LATEST_TAG — release.yml will trigger automatically."
+              echo "🚀 Pushed tag $LATEST_TAG on main HEAD — release.yml will trigger automatically."
             else
               echo "✅ Tag $LATEST_TAG already exists on fork."
             fi
